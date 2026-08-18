@@ -38,12 +38,7 @@ import org.apache.beam.sdk.transforms.{SerializableFunctions, SimpleFunction}
 import org.apache.beam.sdk.values.TypeDescriptor
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.mapreduce.InputFormat
-import org.apache.parquet.avro.{
-  AvroDataSupplier,
-  AvroParquetInputFormat,
-  AvroReadSupport,
-  GenericDataSupplier
-}
+import org.apache.parquet.avro.{AvroDataSupplier, AvroReadSupport, GenericDataSupplier}
 import org.apache.parquet.filter2.predicate.FilterPredicate
 import org.apache.parquet.hadoop.ParquetInputFormat
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -240,8 +235,12 @@ object ParquetAvroIO {
       GcsConnectorUtil.setInputPaths(sc, confOrDefault, filePattern)
       confOrDefault.setClass(
         "mapreduce.job.inputformat.class",
-        classOf[AvroParquetInputFormat[T]],
+        classOf[ParquetInputFormat[T]],
         classOf[InputFormat[_, T]]
+      )
+      confOrDefault.set(
+        ParquetInputFormat.READ_SUPPORT_CLASS,
+        classOf[ScioAvroReadSupport[_]].getName
       )
       confOrDefault.setClass("key.class", classOf[Void], classOf[Void])
       confOrDefault.setClass("value.class", avroClass, avroClass)

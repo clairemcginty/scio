@@ -17,8 +17,8 @@
 package com.spotify.scio.parquet.read
 
 import com.spotify.parquet.tensorflow.TensorflowExampleReadSupport
+import com.spotify.scio.parquet.avro.ScioAvroReadSupport
 import magnolify.parquet.ParquetType
-import org.apache.parquet.avro.AvroReadSupport
 import org.apache.parquet.hadoop.api.ReadSupport
 import org.tensorflow.proto.Example
 
@@ -32,7 +32,7 @@ object ReadSupportFactory {
   }
 
   def avro[T]: ReadSupportFactory[T] = new ReadSupportFactory[T] {
-    def readSupport: ReadSupport[T] = new AvroReadSupport()
+    def readSupport: ReadSupport[T] = new ScioAvroReadSupport()
   }
 
   def example: ReadSupportFactory[Example] = new ReadSupportFactory[Example] {

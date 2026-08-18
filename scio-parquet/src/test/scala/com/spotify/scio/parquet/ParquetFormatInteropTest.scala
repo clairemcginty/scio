@@ -18,58 +18,103 @@
 package com.spotify.scio.parquet
 
 import com.spotify.scio.avro._
+import com.spotify.scio.coders.Coder
 import com.spotify.scio.io.TapSpec
 import com.spotify.scio.testing.PipelineSpec
 import com.spotify.scio.parquet.avro._
+import com.spotify.scio.parquet.read.ParquetReadConfiguration
 import com.spotify.scio.parquet.types._
 import magnolify.parquet.{ArrayEncoding, MagnolifyParquetProperties, ParquetType}
-import org.apache.avro.Schema
-import org.apache.avro.generic.{GenericData, GenericRecord}
+import org.apache.avro.{Schema, SchemaBuilder}
+import org.apache.avro.generic.{GenericData, GenericRecord, GenericRecordBuilder}
 import org.apache.beam.sdk.Pipeline.PipelineExecutionException
+import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.avro.AvroWriteSupport
+import org.scalatest.prop.TableDrivenPropertyChecks.{forAll => forAllCases, Table}
 
 import scala.jdk.CollectionConverters._
 import java.io.File
 
-private case class Nested(i: Int)
-private case class TestRecordScala(a: Int, b: List[String], c: List[Nested], d: Map[String, Int])
+private case class TestRecordScala(
+  int_field: Option[Int],
+  long_field: Option[Long],
+  float_field: Option[Float],
+  double_field: Option[Double],
+  boolean_field: Option[Boolean],
+  string_field: Option[String],
+  array_field: List[String]
+)
 
-object ParquetFormatInteropTest {
-  val AvroSchema = new Schema.Parser().parse(s"""|{
-       |  "type":"record",
-       |  "name":"TestRecord",
-       |  "namespace":"com.spotify.scio.parquet",
-       |  "fields":[
-       |    {"name":"a","type":"int"},
-       |    {"name":"b","type":{"type":"array","items":"string"}},
-       |    {"name":"c","type":{"type":"array","items":{
-       |      "type":"record","name":"array","namespace":"","fields":[{"name":"i","type":"int"}]
-       |    }}},
-       |    {"name":"d","type":{"type":"map","values":"int"}}]}
-       |    """.stripMargin)
-}
 class ParquetFormatInteropTest extends PipelineSpec with TapSpec {
-  import ParquetFormatInteropTest.AvroSchema
 
-  private val nestedSchema = AvroSchema.getField("c").schema().getElementType
+  @scala.annotation.nowarn("cat=unused-privates")
+  private def createConfig(splittable: Boolean): Configuration = {
+    val c = ParquetConfiguration.empty()
+    c.set(ParquetReadConfiguration.UseSplittableDoFn, splittable.toString)
+    c
+  }
+  private val readConfigs =
+    Table(
+      ("config", "description"),
+      (
+        () => ParquetConfiguration.of(ParquetReadConfiguration.UseSplittableDoFn -> false),
+        "legacy read"
+      ),
+      (
+        () => ParquetConfiguration.of(ParquetReadConfiguration.UseSplittableDoFn -> true),
+        "splittable"
+      )
+    )
+
+  private val specificRecords = (1 to 10).map(AvroUtils.newSpecificRecord)
 
   private val genericRecords: Seq[GenericRecord] = (1 to 10).map { i =>
-    val nested = new GenericData.Record(nestedSchema)
-    nested.put("i", i)
-    val record = new GenericData.Record(AvroSchema)
-    record.put("a", i)
-    record.put("b", List(i, i * 2).map(_.toString).asJava)
-    record.put("c", List(nested).asJava)
-    record.put("d", Map("x" -> Integer.valueOf(i)).asJava)
+    val record = new GenericData.Record(TestRecord.getClassSchema)
+    record.put("int_field", i)
+    record.put("long_field", i.toLong)
+    record.put("float_field", i.toFloat)
+    record.put("double_field", i.toDouble)
+    record.put("boolean_field", true)
+    record.put("string_field", "hello")
+    record.put("array_field", List[CharSequence]("a", "b", "c").asJava)
     record
   }
 
   private val typedRecords = (1 to 10).map { i =>
-    TestRecordScala(i, List(i, i * 2).map(_.toString), List(Nested(i)), Map("x" -> i))
+    TestRecordScala(
+      Some(i),
+      Some(i.toLong),
+      Some(i.toFloat),
+      Some(i.toDouble),
+      Some(true),
+      Some("hello"),
+      List("a", "b", "c")
+    )
   }
 
-  implicit val grCoder: com.spotify.scio.coders.Coder[GenericRecord] =
-    avroGenericRecordCoder(AvroSchema)
+  private val avroProjectionSchema: Schema = SchemaBuilder
+    .record("TestRecordProjection")
+    .fields()
+    .nullableInt("int_field", 0)
+    .name("array_field")
+    .`type`(SchemaBuilder.array().items(Schema.create(Schema.Type.STRING)))
+    .noDefault()
+    .endRecord()
+
+  private val avroProjectionWithMissingFieldSchema: Schema = SchemaBuilder
+    .record("TestRecordProjectionWithMissingField")
+    .fields()
+    .nullableInt("int_field", 0)
+    .name("array_field")
+    .`type`(SchemaBuilder.array().items(Schema.create(Schema.Type.STRING)))
+    .noDefault()
+    .optionalString("missing_field")
+    .endRecord()
+
+  val grCoder: Coder[GenericRecord] = avroGenericRecordCoder(TestRecord.getClassSchema)
+  val grProjectionCoder: Coder[GenericRecord] = avroGenericRecordCoder(avroProjectionSchema)
+  val grProjectionWithMissingFieldCoder: Coder[GenericRecord] =
+    avroGenericRecordCoder(avroProjectionWithMissingFieldSchema)
 
   private val ptUngroupedListEncoding = ParquetType[TestRecordScala](
     new MagnolifyParquetProperties {
@@ -94,14 +139,16 @@ class ParquetFormatInteropTest extends PipelineSpec with TapSpec {
       implicit val pt: ParquetType[TestRecordScala] = ptOldListEncoding
 
       runWithRealContext()(
-        _.parallelize(genericRecords)
-          .saveAsParquetAvroFile(dir.toString, schema = AvroSchema)
+        _.parallelize(specificRecords)
+          .saveAsParquetAvroFile(dir.toString)
       )
 
-      runWithRealContext()(
-        _.typedParquetFile[TestRecordScala](s"$dir/*.parquet")
-          .map(identity) should containInAnyOrder(typedRecords)
-      )
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.typedParquetFile[TestRecordScala](s"$dir/*.parquet", conf = c())
+            .map(identity) should containInAnyOrder(typedRecords)
+        )
+      }
   }
 
   it should "be able to read data written with .saveAsParquetAvroFile with new list encoding" in withTempDir {
@@ -110,14 +157,16 @@ class ParquetFormatInteropTest extends PipelineSpec with TapSpec {
       val listConf = ParquetConfiguration.of(AvroWriteSupport.WRITE_OLD_LIST_STRUCTURE -> false)
 
       runWithRealContext()(
-        _.parallelize(genericRecords)
-          .saveAsParquetAvroFile(dir.toString, schema = AvroSchema, conf = listConf)
+        _.parallelize(specificRecords)
+          .saveAsParquetAvroFile(dir.toString, conf = listConf)
       )
 
-      runWithRealContext()(
-        _.typedParquetFile[TestRecordScala](s"$dir/*.parquet")
-          .map(identity) should containInAnyOrder(typedRecords)
-      )
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.typedParquetFile[TestRecordScala](s"$dir/*.parquet", conf = c())
+            .map(identity) should containInAnyOrder(typedRecords)
+        )
+      }
   }
 
   def testFailOnMismatchedReadWriteEncodings(
@@ -164,7 +213,107 @@ class ParquetFormatInteropTest extends PipelineSpec with TapSpec {
       testFailOnMismatchedReadWriteEncodings(ptOldListEncoding, ptUngroupedListEncoding, dir)
   }
 
-  ".parquetAvroFile" should "be able to read data written with .saveAsTypedParquetFile with old list encoding" in withTempDir {
+  ".parquetAvroFile" should "be able to read GenericRecord data written with .saveAsTypedParquetFile with old list encoding" in withTempDir {
+    dir =>
+      implicit val pt: ParquetType[TestRecordScala] = ptOldListEncoding
+      implicit val coder: Coder[GenericRecord] = grCoder
+
+      runWithRealContext()(
+        _.parallelize(typedRecords)
+          .saveAsTypedParquetFile(dir.toString)
+      )
+
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[GenericRecord](
+            s"$dir/*.parquet",
+            projection = TestRecord.getClassSchema,
+            conf = c()
+          )
+            .map(identity) should containInAnyOrder(genericRecords)
+        )
+      }
+  }
+
+  it should "be able to read GenericRecord data written with .saveAsTypedParquetFile with new list encoding" in withTempDir {
+    dir =>
+      implicit val pt: ParquetType[TestRecordScala] = ptNewListEncoding
+      implicit val coder: Coder[GenericRecord] = grCoder
+
+      runWithRealContext()(
+        _.parallelize(typedRecords)
+          .saveAsTypedParquetFile(dir.toString)
+      )
+
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[GenericRecord](
+            s"$dir/*.parquet",
+            projection = TestRecord.getClassSchema,
+            conf = c()
+          )
+            .map(identity) should containInAnyOrder(genericRecords)
+        )
+      }
+  }
+
+  it should "be able to read GenericRecord data written with .saveAsTypedParquetFile with new list encoding and a projected list schema" in withTempDir {
+    dir =>
+      implicit val pt: ParquetType[TestRecordScala] = ptNewListEncoding
+      implicit val coder: Coder[GenericRecord] = grProjectionCoder
+
+      runWithRealContext()(
+        _.parallelize(typedRecords)
+          .saveAsTypedParquetFile(dir.toString)
+      )
+
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[GenericRecord](
+            s"$dir/*.parquet",
+            projection = avroProjectionSchema,
+            conf = c()
+          )
+            .map(identity) should containInAnyOrder(genericRecords.map { gr =>
+            new GenericRecordBuilder(avroProjectionSchema)
+              .set("array_field", gr.get("array_field"))
+              .set("int_field", gr.get("int_field"))
+              .build()
+              .asInstanceOf[GenericRecord]
+          })
+        )
+      }
+  }
+
+  it should "detect new list encoding when the projection contains a missing optional field" in withTempDir {
+    dir =>
+      implicit val pt: ParquetType[TestRecordScala] = ptNewListEncoding
+      implicit val coder: Coder[GenericRecord] = grProjectionWithMissingFieldCoder
+
+      runWithRealContext()(
+        _.parallelize(typedRecords)
+          .saveAsTypedParquetFile(dir.toString)
+      )
+
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[GenericRecord](
+            s"$dir/*.parquet",
+            projection = avroProjectionWithMissingFieldSchema,
+            conf = c()
+          )
+            .map(identity) should containInAnyOrder(genericRecords.map { gr =>
+            new GenericRecordBuilder(avroProjectionWithMissingFieldSchema)
+              .set("array_field", gr.get("array_field"))
+              .set("int_field", gr.get("int_field"))
+              .build()
+              .asInstanceOf[GenericRecord]
+          })
+        )
+      }
+  }
+
+  it should "be able to read SpecificRecord data written with .saveAsTypedParquetFile with old list encoding" in withTempDir {
     dir =>
       implicit val pt: ParquetType[TestRecordScala] = ptOldListEncoding
 
@@ -173,29 +322,51 @@ class ParquetFormatInteropTest extends PipelineSpec with TapSpec {
           .saveAsTypedParquetFile(dir.toString)
       )
 
-      runWithRealContext()(
-        _.parquetAvroFile[GenericRecord](s"$dir/*.parquet", projection = pt.avroSchema)
-          .map(identity) should containInAnyOrder(genericRecords)
-      )
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[TestRecord](s"$dir/*.parquet", conf = c())
+            .map(identity) should containInAnyOrder(specificRecords)
+        )
+      }
   }
 
-  it should "be able to read data written with .saveAsTypedParquetFile with new list encoding" in withTempDir {
+  it should "be able to read SpecificRecord data written with .saveAsTypedParquetFile with new list encoding" in withTempDir {
     dir =>
       implicit val pt: ParquetType[TestRecordScala] = ptNewListEncoding
-      val listConf = ParquetConfiguration.of(AvroWriteSupport.WRITE_OLD_LIST_STRUCTURE -> false)
 
       runWithRealContext()(
         _.parallelize(typedRecords)
           .saveAsTypedParquetFile(dir.toString)
       )
 
-      runWithRealContext()(
-        _.parquetAvroFile[GenericRecord](
-          s"$dir/*.parquet",
-          projection = pt.avroSchema,
-          conf = listConf
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[TestRecord](s"$dir/*.parquet", conf = c())
+            .map(identity) should containInAnyOrder(specificRecords)
         )
-          .map(identity) should containInAnyOrder(genericRecords)
+      }
+  }
+
+  it should "be able to read SpecificRecord data written with .saveAsTypedParquetFile with new list encoding and a projected list schema" in withTempDir {
+    dir =>
+      implicit val pt: ParquetType[TestRecordScala] = ptNewListEncoding
+
+      runWithRealContext()(
+        _.parallelize(typedRecords)
+          .saveAsTypedParquetFile(dir.toString)
       )
+
+      forAllCases(readConfigs) { case (c, _) =>
+        runWithRealContext()(
+          _.parquetAvroFile[TestRecord](
+            s"$dir/*.parquet",
+            conf = c(),
+            projection = avroProjectionSchema
+          )
+            .map(identity) should containInAnyOrder(specificRecords.map { sr =>
+            TestRecord.newBuilder().setArrayField(sr.array_field).setIntField(sr.int_field).build()
+          })
+        )
+      }
   }
 }
